@@ -6,21 +6,36 @@ Add your keys to .env:
     ANTHROPIC_API_KEY=sk-ant-...
     OPENAI_API_KEY=sk-...
 """
-import os
+import asyncio
+
+from app.config import settings
 
 # Map a short model name -> (provider, full_model_id)
 MODEL_REGISTRY = {
-    "claude": ("anthropic", "claude-sonnet-4-20250514"),
-    "claude-opus": ("anthropic", "claude-opus-4-20250514"),
+    "claude": ("anthropic", "claude-sonnet-4-6"),
+    "claude-opus": ("anthropic", "claude-opus-4-7"),
     "gpt": ("openai", "gpt-4o"),
     "gpt-mini": ("openai", "gpt-4o-mini"),
 }
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude")
+DEFAULT_MODEL = settings.DEFAULT_MODEL
+LLM_TIMEOUT = 30.0  # seconds
 
 
 class LLMError(Exception):
     """Raised when an LLM call fails or is misconfigured."""
+
+
+class LLMTimeoutError(LLMError):
+    """Raised when the provider does not respond within LLM_TIMEOUT seconds."""
+
+
+class LLMRateLimitError(LLMError):
+    """Raised when the provider returns a rate-limit / quota error."""
+
+
+class LLMConnectionError(LLMError):
+    """Raised when the network connection to the provider fails."""
 
 
 def resolve_model(short_name: str | None) -> tuple[str, str, str]:
@@ -37,35 +52,61 @@ def resolve_model(short_name: str | None) -> tuple[str, str, str]:
 async def _call_anthropic(model_id: str, history: list[dict]) -> str:
     import anthropic
 
-    key = os.getenv("ANTHROPIC_API_KEY")
+    key = settings.ANTHROPIC_API_KEY
     if not key:
-        raise LLMError("ANTHROPIC_API_KEY is not set in the environment.")
+        raise LLMError("The AI service is not configured. Please contact support.")
 
     client = anthropic.AsyncAnthropic(api_key=key)
-    resp = await client.messages.create(
-        model=model_id,
-        max_tokens=1024,
-        messages=history,  # [{"role": "user"|"assistant", "content": "..."}]
-    )
-    # Concatenate any text blocks in the response.
+    try:
+        resp = await asyncio.wait_for(
+            client.messages.create(
+                model=model_id,
+                max_tokens=1024,
+                messages=history,
+            ),
+            timeout=LLM_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
+    except anthropic.RateLimitError:
+        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    except anthropic.APIConnectionError:
+        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
+    except anthropic.APIStatusError as e:
+        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
+    except Exception as e:
+        raise LLMError(f"Unexpected error from AI provider. Please try again.")
+
     return "".join(
         block.text for block in resp.content if getattr(block, "type", None) == "text"
     )
 
 
 async def _call_openai(model_id: str, history: list[dict]) -> str:
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 
-    key = os.getenv("OPENAI_API_KEY")
+    key = settings.OPENAI_API_KEY
     if not key:
-        raise LLMError("OPENAI_API_KEY is not set in the environment.")
+        raise LLMError("The AI service is not configured. Please contact support.")
 
-    client = AsyncOpenAI(api_key=key)
-    resp = await client.chat.completions.create(
-        model=model_id,
-        max_tokens=1024,
-        messages=history,
-    )
+    client = AsyncOpenAI(api_key=key, timeout=LLM_TIMEOUT)
+    try:
+        resp = await client.chat.completions.create(
+            model=model_id,
+            max_tokens=1024,
+            messages=history,
+        )
+    except APITimeoutError:
+        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
+    except RateLimitError:
+        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    except APIConnectionError:
+        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
+    except APIStatusError as e:
+        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
+    except Exception:
+        raise LLMError("Unexpected error from AI provider. Please try again.")
+
     return resp.choices[0].message.content or ""
 
 
@@ -92,45 +133,68 @@ async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[s
 async def _stream_anthropic(model_id: str, history: list[dict]):
     import anthropic
 
-    key = os.getenv("ANTHROPIC_API_KEY")
+    key = settings.ANTHROPIC_API_KEY
     if not key:
-        raise LLMError("ANTHROPIC_API_KEY is not set in the environment.")
+        raise LLMError("The AI service is not configured. Please contact support.")
 
     client = anthropic.AsyncAnthropic(api_key=key)
-    async with client.messages.stream(
-        model=model_id,
-        max_tokens=1024,
-        messages=history,
-    ) as stream:
-        async for text in stream.text_stream:
-            yield text
+    try:
+        async with client.messages.stream(
+            model=model_id,
+            max_tokens=1024,
+            messages=history,
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+    except anthropic.RateLimitError:
+        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    except anthropic.APIConnectionError:
+        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
+    except anthropic.APIStatusError as e:
+        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
+    except LLMError:
+        raise
+    except Exception:
+        raise LLMError("Unexpected error from AI provider. Please try again.")
 
 
 async def _stream_openai(model_id: str, history: list[dict]):
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
 
-    key = os.getenv("OPENAI_API_KEY")
+    key = settings.OPENAI_API_KEY
     if not key:
-        raise LLMError("OPENAI_API_KEY is not set in the environment.")
+        raise LLMError("The AI service is not configured. Please contact support.")
 
-    client = AsyncOpenAI(api_key=key)
-    stream = await client.chat.completions.create(
-        model=model_id,
-        max_tokens=1024,
-        messages=history,
-        stream=True,
-    )
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+    client = AsyncOpenAI(api_key=key, timeout=LLM_TIMEOUT)
+    try:
+        stream = await client.chat.completions.create(
+            model=model_id,
+            max_tokens=1024,
+            messages=history,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except APITimeoutError:
+        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
+    except RateLimitError:
+        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    except APIConnectionError:
+        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
+    except APIStatusError as e:
+        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
+    except LLMError:
+        raise
+    except Exception:
+        raise LLMError("Unexpected error from AI provider. Please try again.")
 
 
 async def stream_reply(short_name: str | None, history: list[dict]):
     """
     Async generator yielding text chunks from the chosen model.
-    Yields a final tuple sentinel? No — caller accumulates chunks itself.
-    Raises LLMError before the first yield if misconfigured.
+    Raises an LLMError subclass on failure — caller sends it to the client.
     """
     name, provider, model_id = resolve_model(short_name)
 

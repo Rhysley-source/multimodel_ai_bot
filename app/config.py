@@ -33,6 +33,20 @@ class Settings:
         "DATABASE_URL", "sqlite+aiosqlite:///./auth.db"
     )
 
+    # LLM API keys
+    ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
+    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "claude")
+
+    # Comma-separated list of allowed CORS origins.
+    CORS_ORIGINS: list[str] = [
+        o.strip()
+        for o in os.getenv(
+            "CORS_ORIGINS", "http://localhost:3000,http://localhost:5173"
+        ).split(",")
+        if o.strip()
+    ]
+
     @property
     def access_token_expires(self) -> timedelta:
         return timedelta(minutes=self.ACCESS_TOKEN_EXPIRE_MINUTES)

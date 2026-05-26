@@ -85,3 +85,10 @@ class ConversationOut(BaseModel):
 
 class ConversationDetail(ConversationOut):
     messages: list[MessageOut] = []
+
+
+class ChatErrorResponse(BaseModel):
+    """Returned (HTTP 502/503/504/429) when the LLM provider fails.
+    `user_message` is echoed back so the frontend can restore the input field."""
+    detail: str
+    user_message: str

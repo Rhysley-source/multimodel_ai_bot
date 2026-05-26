@@ -1,14 +1,22 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import AsyncSessionLocal, get_db
 from app.dependencies import get_current_user
-from app.llm import LLMError, generate_reply, resolve_model, stream_reply
+from app.llm import (
+    LLMConnectionError,
+    LLMError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    generate_reply,
+    resolve_model,
+    stream_reply,
+)
 from app.models import Conversation, Message, User
 from app.schemas import (
     ChatRequest,
@@ -17,7 +25,36 @@ from app.schemas import (
     ConversationOut,
 )
 
+
+def _llm_error_response(e: LLMError, user_message: str) -> JSONResponse:
+    """Map an LLMError to the right HTTP status and echo back the user's message."""
+    if isinstance(e, LLMTimeoutError):
+        code = status.HTTP_504_GATEWAY_TIMEOUT
+    elif isinstance(e, LLMRateLimitError):
+        code = status.HTTP_429_TOO_MANY_REQUESTS
+    elif isinstance(e, LLMConnectionError):
+        code = status.HTTP_503_SERVICE_UNAVAILABLE
+    else:
+        code = status.HTTP_502_BAD_GATEWAY
+    return JSONResponse(
+        status_code=code,
+        content={"detail": str(e), "user_message": user_message},
+    )
+
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+@router.post("/conversations", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new empty conversation and return its id."""
+    conversation = Conversation(user_id=current_user.id)
+    db.add(conversation)
+    await db.commit()
+    await db.refresh(conversation)
+    return conversation
 
 
 @router.post("", response_model=ChatResponse)
@@ -60,9 +97,7 @@ async def send_message(
     try:
         reply_text, model_name = await generate_reply(payload.model, history)
     except LLMError as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)
-        )
+        return _llm_error_response(e, payload.message)
 
     # 4. Persist both the user message and the assistant reply.
     db.add(Message(
@@ -147,11 +182,20 @@ async def send_message_stream(
             async for delta in stream_reply(payload.model, history):
                 full_reply.append(delta)
                 yield sse({"type": "chunk", "delta": delta})
-        except LLMError as e:
-            yield sse({"type": "error", "detail": str(e)})
+        except LLMTimeoutError as e:
+            yield sse({"type": "error", "code": 504, "detail": str(e), "user_message": user_message})
             return
-        except Exception as e:  # surface unexpected provider errors to the client
-            yield sse({"type": "error", "detail": f"Stream failed: {e}"})
+        except LLMRateLimitError as e:
+            yield sse({"type": "error", "code": 429, "detail": str(e), "user_message": user_message})
+            return
+        except LLMConnectionError as e:
+            yield sse({"type": "error", "code": 503, "detail": str(e), "user_message": user_message})
+            return
+        except LLMError as e:
+            yield sse({"type": "error", "code": 502, "detail": str(e), "user_message": user_message})
+            return
+        except Exception as e:
+            yield sse({"type": "error", "code": 502, "detail": "Something went wrong. Please try again.", "user_message": user_message})
             return
 
         reply_text = "".join(full_reply)

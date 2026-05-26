@@ -7,6 +7,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import Base, engine, get_db
 from app.dependencies import bearer_scheme, get_current_user
 from app.routers import chat as chat_router
@@ -42,10 +43,7 @@ app = FastAPI(title="FastAPI JWT Auth + Chat (async)", version="1.1.0", lifespan
 # Allow the frontend (different origin) to call the API.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-    ],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
