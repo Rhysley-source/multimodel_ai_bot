@@ -1,3 +1,5 @@
+import logging
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -6,6 +8,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import declarative_base
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 async def ensure_database_exists() -> None:
@@ -30,17 +34,17 @@ async def ensure_database_exists() -> None:
                 {"name": db_name},
             )
             if result.scalar():
-                print(f"[startup] Database '{db_name}' already exists.")
+                logger.info("Database '%s' already exists.", db_name)
                 return
             await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
-            print(f"[startup] Database '{db_name}' created.")
+            logger.info("Database '%s' created.", db_name)
     except exc.ProgrammingError as e:
         if "permission denied" in str(e).lower():
-            print(
-                f"[startup] WARNING: No CREATEDB privilege — skipping auto-create.\n"
-                f"          Create the database manually:\n"
-                f"          psql -U postgres -c 'CREATE DATABASE \"{db_name}\";'\n"
-                f"          Continuing startup (DB may already exist)..."
+            logger.warning(
+                "No CREATEDB privilege — skipping auto-create. "
+                "Create manually: psql -U postgres -c 'CREATE DATABASE \"%s\";' "
+                "Continuing startup (DB may already exist)...",
+                db_name,
             )
         else:
             raise

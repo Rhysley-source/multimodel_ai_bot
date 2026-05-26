@@ -1,209 +1,182 @@
 """
-LLM service layer. Abstracts over multiple providers (Anthropic, OpenAI)
-so routes don't depend on a specific SDK.
+LLM service layer — powered by LangChain.
+Supports OpenAI, Grok, DeepSeek, and Anthropic through a single unified interface.
 
 Add your keys to .env:
-    ANTHROPIC_API_KEY=sk-ant-...
     OPENAI_API_KEY=sk-...
+    GROK_API_KEY=xai-...
+    DEEPSEEK_API_KEY=sk-...
+    ANTHROPIC_API_KEY=sk-ant-...
 """
-import asyncio
+import logging
+from typing import AsyncGenerator
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.config import settings
 
-# Map a short model name -> (provider, full_model_id)
+logger = logging.getLogger(__name__)
+
+# Map short model name -> (provider, full_model_id)
 MODEL_REGISTRY = {
-    "claude": ("anthropic", "claude-sonnet-4-6"),
-    "claude-opus": ("anthropic", "claude-opus-4-7"),
-    "gpt": ("openai", "gpt-4o"),
-    "gpt-mini": ("openai", "gpt-4o-mini"),
+    # OpenAI
+    "gpt":              ("openai",    "gpt-4o"),
+    "gpt-mini":         ("openai",    "gpt-4o-mini"),
+    # xAI Grok
+    "grok":             ("grok",      "grok-3"),
+    "grok-mini":        ("grok",      "grok-3-mini"),
+    # DeepSeek
+    "deepseek":         ("deepseek",  "deepseek-chat"),
+    "deepseek-r1":      ("deepseek",  "deepseek-reasoner"),
+    # Anthropic Claude
+    "claude":           ("anthropic", "claude-sonnet-4-6"),
+    "claude-opus":      ("anthropic", "claude-opus-4-7"),
 }
 
 DEFAULT_MODEL = settings.DEFAULT_MODEL
-LLM_TIMEOUT = 30.0  # seconds
+LLM_TIMEOUT   = 30.0
 
 
 class LLMError(Exception):
     """Raised when an LLM call fails or is misconfigured."""
 
-
 class LLMTimeoutError(LLMError):
-    """Raised when the provider does not respond within LLM_TIMEOUT seconds."""
-
+    """Provider did not respond within LLM_TIMEOUT seconds."""
 
 class LLMRateLimitError(LLMError):
-    """Raised when the provider returns a rate-limit / quota error."""
-
+    """Provider rate-limit / quota exceeded."""
 
 class LLMConnectionError(LLMError):
-    """Raised when the network connection to the provider fails."""
+    """Network connection to the provider failed."""
 
 
 def resolve_model(short_name: str | None) -> tuple[str, str, str]:
-    """Return (short_name, provider, full_model_id) for a requested model."""
+    """Return (short_name, provider, full_model_id)."""
     name = short_name or DEFAULT_MODEL
     if name not in MODEL_REGISTRY:
-        raise LLMError(
-            f"Unknown model '{name}'. Available: {', '.join(MODEL_REGISTRY)}"
-        )
+        raise LLMError(f"Unknown model '{name}'. Available: {', '.join(MODEL_REGISTRY)}")
     provider, full_id = MODEL_REGISTRY[name]
     return name, provider, full_id
 
 
-async def _call_anthropic(model_id: str, history: list[dict]) -> str:
-    import anthropic
+def _build_llm(provider: str, model_id: str):
+    """Instantiate the correct LangChain chat model for the given provider."""
+    from langchain_openai import ChatOpenAI
 
-    key = settings.ANTHROPIC_API_KEY
-    if not key:
-        raise LLMError("The AI service is not configured. Please contact support.")
+    if provider == "openai":
+        if not settings.OPENAI_API_KEY:
+            raise LLMError("OPENAI_API_KEY is not set in .env.")
+        return ChatOpenAI(
+            model=model_id,
+            api_key=settings.OPENAI_API_KEY,
+            max_tokens=1024,
+            timeout=LLM_TIMEOUT,
+            streaming=True,
+        )
 
-    client = anthropic.AsyncAnthropic(api_key=key)
-    try:
-        resp = await asyncio.wait_for(
-            client.messages.create(
-                model=model_id,
-                max_tokens=1024,
-                messages=history,
-            ),
+    if provider == "grok":
+        if not settings.GROK_API_KEY:
+            raise LLMError("GROK_API_KEY is not set in .env.")
+        return ChatOpenAI(
+            model=model_id,
+            api_key=settings.GROK_API_KEY,
+            base_url="https://api.x.ai/v1",
+            max_tokens=1024,
+            timeout=LLM_TIMEOUT,
+            streaming=True,
+        )
+
+    if provider == "deepseek":
+        if not settings.DEEPSEEK_API_KEY:
+            raise LLMError("DEEPSEEK_API_KEY is not set in .env.")
+        return ChatOpenAI(
+            model=model_id,
+            api_key=settings.DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com/v1",
+            max_tokens=1024,
+            timeout=LLM_TIMEOUT,
+            streaming=True,
+        )
+
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        if not settings.ANTHROPIC_API_KEY:
+            raise LLMError("ANTHROPIC_API_KEY is not set in .env.")
+        return ChatAnthropic(
+            model=model_id,
+            api_key=settings.ANTHROPIC_API_KEY,
+            max_tokens=1024,
             timeout=LLM_TIMEOUT,
         )
-    except asyncio.TimeoutError:
-        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
-    except anthropic.RateLimitError:
-        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
-    except anthropic.APIConnectionError:
-        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
-    except anthropic.APIStatusError as e:
-        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
-    except Exception as e:
-        raise LLMError(f"Unexpected error from AI provider. Please try again.")
 
-    return "".join(
-        block.text for block in resp.content if getattr(block, "type", None) == "text"
-    )
+    raise LLMError(f"Unsupported provider: {provider}")
 
 
-async def _call_openai(model_id: str, history: list[dict]) -> str:
-    from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
+def _build_messages(history: list[dict]) -> list:
+    """Convert history dicts to LangChain message objects with system prompt."""
+    msgs = [SystemMessage(content=settings.SYSTEM_PROMPT)]
+    for m in history:
+        if m["role"] == "user":
+            msgs.append(HumanMessage(content=m["content"]))
+        else:
+            msgs.append(AIMessage(content=m["content"]))
+    return msgs
 
-    key = settings.OPENAI_API_KEY
-    if not key:
-        raise LLMError("The AI service is not configured. Please contact support.")
 
-    client = AsyncOpenAI(api_key=key, timeout=LLM_TIMEOUT)
-    try:
-        resp = await client.chat.completions.create(
-            model=model_id,
-            max_tokens=1024,
-            messages=history,
-        )
-    except APITimeoutError:
-        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
-    except RateLimitError:
-        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
-    except APIConnectionError:
-        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
-    except APIStatusError as e:
-        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
-    except Exception:
-        raise LLMError("Unexpected error from AI provider. Please try again.")
-
-    return resp.choices[0].message.content or ""
+def _wrap_error(e: Exception) -> LLMError:
+    """Map provider-specific exceptions to our LLMError hierarchy."""
+    msg = str(e).lower()
+    if "timeout" in msg or "timed out" in msg:
+        return LLMTimeoutError("The AI took too long to respond. Please try again.")
+    if "rate" in msg or "quota" in msg or "429" in msg:
+        return LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    if "connection" in msg or "network" in msg:
+        return LLMConnectionError("Could not connect to the AI service. Please try again.")
+    if "401" in msg or "invalid" in msg or "unauthorized" in msg or "ip" in msg:
+        return LLMError(f"The AI service returned an error (HTTP 401). Please try again.")
+    if "status" in msg or "http" in msg:
+        return LLMError(f"The AI service returned an error. Please try again.")
+    logger.exception("Unexpected LLM error: %s", e)
+    return LLMError("Unexpected error from AI provider. Please try again.")
 
 
 async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[str, str]:
     """
-    Send conversation `history` to the chosen model and return (reply_text, model_name).
-    `history` is a list of {"role", "content"} dicts, oldest first, ending with
-    the latest user message.
+    Send history to the chosen model and return (reply_text, model_name).
+    history: list of {"role": "user"|"assistant", "content": "..."}, oldest first.
     """
     name, provider, model_id = resolve_model(short_name)
+    llm = _build_llm(provider, model_id)
+    messages = _build_messages(history)
 
-    if provider == "anthropic":
-        reply = await _call_anthropic(model_id, history)
-    elif provider == "openai":
-        reply = await _call_openai(model_id, history)
-    else:
-        raise LLMError(f"Unsupported provider: {provider}")
+    logger.info("LLM request | model=%s provider=%s messages=%d", name, provider, len(messages))
+    try:
+        response = await llm.ainvoke(messages)
+        reply = response.content
+    except LLMError:
+        raise
+    except Exception as e:
+        raise _wrap_error(e) from e
 
+    logger.info("LLM response | model=%s chars=%d", name, len(reply))
     return reply, name
 
 
-# ---------- Streaming variants ----------
-
-async def _stream_anthropic(model_id: str, history: list[dict]):
-    import anthropic
-
-    key = settings.ANTHROPIC_API_KEY
-    if not key:
-        raise LLMError("The AI service is not configured. Please contact support.")
-
-    client = anthropic.AsyncAnthropic(api_key=key)
-    try:
-        async with client.messages.stream(
-            model=model_id,
-            max_tokens=1024,
-            messages=history,
-        ) as stream:
-            async for text in stream.text_stream:
-                yield text
-    except anthropic.RateLimitError:
-        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
-    except anthropic.APIConnectionError:
-        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
-    except anthropic.APIStatusError as e:
-        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
-    except LLMError:
-        raise
-    except Exception:
-        raise LLMError("Unexpected error from AI provider. Please try again.")
-
-
-async def _stream_openai(model_id: str, history: list[dict]):
-    from openai import AsyncOpenAI, APITimeoutError, RateLimitError, APIConnectionError, APIStatusError
-
-    key = settings.OPENAI_API_KEY
-    if not key:
-        raise LLMError("The AI service is not configured. Please contact support.")
-
-    client = AsyncOpenAI(api_key=key, timeout=LLM_TIMEOUT)
-    try:
-        stream = await client.chat.completions.create(
-            model=model_id,
-            max_tokens=1024,
-            messages=history,
-            stream=True,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
-    except APITimeoutError:
-        raise LLMTimeoutError("The AI took too long to respond. Please try again.")
-    except RateLimitError:
-        raise LLMRateLimitError("Too many requests. Please wait a moment and try again.")
-    except APIConnectionError:
-        raise LLMConnectionError("Could not connect to the AI service. Please try again.")
-    except APIStatusError as e:
-        raise LLMError(f"The AI service returned an error (HTTP {e.status_code}). Please try again.")
-    except LLMError:
-        raise
-    except Exception:
-        raise LLMError("Unexpected error from AI provider. Please try again.")
-
-
-async def stream_reply(short_name: str | None, history: list[dict]):
+async def stream_reply(short_name: str | None, history: list[dict]) -> AsyncGenerator[str, None]:
     """
     Async generator yielding text chunks from the chosen model.
-    Raises an LLMError subclass on failure — caller sends it to the client.
+    Raises an LLMError subclass on failure.
     """
     name, provider, model_id = resolve_model(short_name)
+    llm = _build_llm(provider, model_id)
+    messages = _build_messages(history)
 
-    if provider == "anthropic":
-        gen = _stream_anthropic(model_id, history)
-    elif provider == "openai":
-        gen = _stream_openai(model_id, history)
-    else:
-        raise LLMError(f"Unsupported provider: {provider}")
-
-    async for chunk in gen:
-        yield chunk
+    logger.info("LLM stream | model=%s provider=%s messages=%d", name, provider, len(messages))
+    try:
+        async for chunk in llm.astream(messages):
+            if chunk.content:
+                yield chunk.content
+    except LLMError:
+        raise
+    except Exception as e:
+        raise _wrap_error(e) from e

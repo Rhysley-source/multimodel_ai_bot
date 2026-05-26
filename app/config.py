@@ -33,10 +33,25 @@ class Settings:
         "DATABASE_URL", "sqlite+aiosqlite:///./auth.db"
     )
 
+    # Logging
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    LOG_FILE: str | None = os.getenv("LOG_FILE", "logs/app.log")
+
+    # Max previous messages sent to LLM for context (excludes current user message)
+    HISTORY_LIMIT: int = int(os.getenv("HISTORY_LIMIT", "10"))
+
+    # System prompt — sets the LLM's persona and behaviour
+    SYSTEM_PROMPT: str = os.getenv(
+        "SYSTEM_PROMPT",
+        "You are a helpful, friendly AI assistant. Answer clearly and concisely.",
+    )
+
     # LLM API keys
     ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
-    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "claude")
+    OPENAI_API_KEY:    str | None = os.getenv("OPENAI_API_KEY", "").strip() or None
+    GROK_API_KEY:      str | None = os.getenv("GROK_API_KEY", "").strip() or None
+    DEEPSEEK_API_KEY:  str | None = os.getenv("DEEPSEEK_API_KEY", "").strip() or None
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-mini")
 
     # Comma-separated list of allowed CORS origins.
     CORS_ORIGINS: list[str] = [

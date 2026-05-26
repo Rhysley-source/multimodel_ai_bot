@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 import jwt
@@ -9,6 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import Base, engine, ensure_database_exists, get_db
+from app.logger import setup_logging
+
+logger = logging.getLogger(__name__)
 from app.dependencies import bearer_scheme, get_current_user
 from app.routers import chat as chat_router
 from app.models import TokenBlocklist, User
@@ -32,10 +36,14 @@ from app.security import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await ensure_database_exists()       # create DB if missing
+    setup_logging(log_level=settings.LOG_LEVEL, log_file=settings.LOG_FILE)
+    logger.info("Starting up — log_level=%s log_file=%s", settings.LOG_LEVEL, settings.LOG_FILE)
+    await ensure_database_exists()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)   # create tables if missing
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database ready.")
     yield
+    logger.info("Shutting down.")
 
 
 app = FastAPI(title="FastAPI JWT Auth + Chat (async)", version="1.1.0", lifespan=lifespan)
@@ -75,6 +83,7 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    logger.info("Signup success | user_id=%s username=%s", user.id, user.username)
 
     subject = str(user.id)
     return AuthResponse(
@@ -94,11 +103,13 @@ async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
     )
     user = result.scalar_one_or_none()
     if not user or not verify_password(payload.password, user.hashed_password):
+        logger.warning("Login failed | username=%s", payload.username)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
         )
 
+    logger.info("Login success | user_id=%s username=%s", user.id, user.username)
     subject = str(user.id)
     return AuthResponse(
         user=user,
