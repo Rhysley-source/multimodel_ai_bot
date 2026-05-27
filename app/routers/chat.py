@@ -83,10 +83,12 @@ async def send_message(
                 detail="Conversation not found",
             )
         existing_messages = conversation.messages  # eagerly loaded above
+        if not conversation.title:
+            conversation.title = payload.message[:60]
     else:
         conversation = Conversation(
             user_id=current_user.id,
-            title=payload.message[:60],  # first message as a rough title
+            title=payload.message[:60],
         )
         db.add(conversation)
         await db.flush()  # assign an id without committing yet
@@ -160,6 +162,8 @@ async def send_message_stream(
                 detail="Conversation not found",
             )
         existing_messages = conversation.messages
+        if not conversation.title:
+            conversation.title = payload.message[:60]
     else:
         conversation = Conversation(
             user_id=current_user.id, title=payload.message[:60]
