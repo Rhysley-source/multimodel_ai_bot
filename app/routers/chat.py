@@ -48,7 +48,7 @@ def _llm_error_response(e: LLMError, user_message: str) -> JSONResponse:
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
-@router.post("/conversations", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
+@router.post("/start", response_model=ConversationOut, status_code=status.HTTP_201_CREATED)
 async def create_conversation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
