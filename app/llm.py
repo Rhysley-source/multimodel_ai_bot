@@ -36,6 +36,10 @@ MODEL_REGISTRY = {
 DEFAULT_MODEL = settings.DEFAULT_MODEL
 LLM_TIMEOUT   = 30.0
 
+# Shared LLM client cache — one instance per (provider, model_id)
+# LangChain chat models are stateless and safe to reuse across requests.
+_llm_cache: dict[str, object] = {}
+
 
 class LLMError(Exception):
     """Raised when an LLM call fails or is misconfigured."""
@@ -60,13 +64,19 @@ def resolve_model(short_name: str | None) -> tuple[str, str, str]:
 
 
 def _build_llm(provider: str, model_id: str):
-    """Instantiate the correct LangChain chat model for the given provider."""
+    """Return a cached LangChain chat model — creates once, reuses across requests."""
+    cache_key = f"{provider}:{model_id}"
+    if cache_key in _llm_cache:
+        return _llm_cache[cache_key]
+
     from langchain_openai import ChatOpenAI
+
+    llm = None
 
     if provider == "openai":
         if not settings.OPENAI_API_KEY:
             raise LLMError("OPENAI_API_KEY is not set in .env.")
-        return ChatOpenAI(
+        llm = ChatOpenAI(
             model=model_id,
             api_key=settings.OPENAI_API_KEY,
             max_tokens=1024,
@@ -74,10 +84,10 @@ def _build_llm(provider: str, model_id: str):
             streaming=True,
         )
 
-    if provider == "grok":
+    elif provider == "grok":
         if not settings.GROK_API_KEY:
             raise LLMError("GROK_API_KEY is not set in .env.")
-        return ChatOpenAI(
+        llm = ChatOpenAI(
             model=model_id,
             api_key=settings.GROK_API_KEY,
             base_url="https://api.x.ai/v1",
@@ -86,10 +96,10 @@ def _build_llm(provider: str, model_id: str):
             streaming=True,
         )
 
-    if provider == "deepseek":
+    elif provider == "deepseek":
         if not settings.DEEPSEEK_API_KEY:
             raise LLMError("DEEPSEEK_API_KEY is not set in .env.")
-        return ChatOpenAI(
+        llm = ChatOpenAI(
             model=model_id,
             api_key=settings.DEEPSEEK_API_KEY,
             base_url="https://api.deepseek.com/v1",
@@ -98,18 +108,22 @@ def _build_llm(provider: str, model_id: str):
             streaming=True,
         )
 
-    if provider == "anthropic":
+    elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         if not settings.ANTHROPIC_API_KEY:
             raise LLMError("ANTHROPIC_API_KEY is not set in .env.")
-        return ChatAnthropic(
+        llm = ChatAnthropic(
             model=model_id,
             api_key=settings.ANTHROPIC_API_KEY,
             max_tokens=1024,
             timeout=LLM_TIMEOUT,
         )
 
-    raise LLMError(f"Unsupported provider: {provider}")
+    else:
+        raise LLMError(f"Unsupported provider: {provider}")
+
+    _llm_cache[cache_key] = llm
+    return llm
 
 
 def _build_messages(history: list[dict]) -> list:

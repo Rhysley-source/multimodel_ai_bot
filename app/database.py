@@ -52,7 +52,14 @@ async def ensure_database_exists() -> None:
         await admin_engine.dispose()
 
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_timeout=settings.DB_POOL_TIMEOUT,
+    pool_pre_ping=True,      # drop stale connections automatically
+)
 
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

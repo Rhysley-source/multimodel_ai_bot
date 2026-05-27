@@ -1,12 +1,20 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class UserCreate(BaseModel):
+    fullname: str = Field(min_length=1, max_length=100)
     email: EmailStr
     username: str = Field(min_length=3, max_length=50)
     password: str = Field(min_length=8, max_length=128)
+    confirm_password: str
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> "UserCreate":
+        if self.password != self.confirm_password:
+            raise ValueError("Passwords do not match")
+        return self
 
 
 class UserLogin(BaseModel):
@@ -17,6 +25,7 @@ class UserLogin(BaseModel):
 
 class UserOut(BaseModel):
     id: int
+    fullname: str | None
     email: EmailStr
     username: str
     created_at: datetime

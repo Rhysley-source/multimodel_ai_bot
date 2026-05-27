@@ -76,6 +76,7 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)):
         )
 
     user = User(
+        fullname=payload.fullname,
         email=payload.email,
         username=payload.username,
         hashed_password=hash_password(payload.password),
