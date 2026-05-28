@@ -75,5 +75,23 @@ class Settings:
     def refresh_token_expires(self) -> timedelta:
         return timedelta(days=self.REFRESH_TOKEN_EXPIRE_DAYS)
 
+    def validate_secret_key(self) -> None:
+        """Warn if the default insecure secret key is still in use."""
+        if self.SECRET_KEY == "CHANGE_ME_dev_only_secret_key_do_not_use_in_production":
+            import logging
+            logging.getLogger(__name__).warning(
+                "SECRET_KEY is set to the default insecure value. "
+                "Generate a strong key: openssl rand -hex 32"
+            )
+
+    def at_least_one_llm_key(self) -> bool:
+        """Return True if at least one LLM provider key is configured."""
+        return any([
+            self.OPENAI_API_KEY,
+            self.ANTHROPIC_API_KEY,
+            self.GROK_API_KEY,
+            self.DEEPSEEK_API_KEY,
+        ])
+
 
 settings = Settings()

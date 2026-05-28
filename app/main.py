@@ -38,6 +38,9 @@ from app.security import (
 async def lifespan(app: FastAPI):
     setup_logging(log_level=settings.LOG_LEVEL, log_file=settings.LOG_FILE)
     logger.info("Starting up — log_level=%s log_file=%s", settings.LOG_LEVEL, settings.LOG_FILE)
+    settings.validate_secret_key()
+    if not settings.at_least_one_llm_key():
+        logger.warning("No LLM API keys configured — all chat requests will fail until a key is added to .env")
     await ensure_database_exists()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

@@ -144,12 +144,16 @@ def _wrap_error(e: Exception) -> LLMError:
         return LLMTimeoutError("The AI took too long to respond. Please try again.")
     if "rate" in msg or "quota" in msg or "429" in msg:
         return LLMRateLimitError("Too many requests. Please wait a moment and try again.")
+    if "credits" in msg or "spending" in msg or "billing" in msg or "balance" in msg:
+        return LLMRateLimitError("AI provider credits exhausted. Please top up your account.")
+    if "403" in msg or "permission" in msg:
+        return LLMError("Access denied by AI provider. Check your API key permissions.")
     if "connection" in msg or "network" in msg:
         return LLMConnectionError("Could not connect to the AI service. Please try again.")
     if "401" in msg or "invalid" in msg or "unauthorized" in msg or "ip" in msg:
-        return LLMError(f"The AI service returned an error (HTTP 401). Please try again.")
+        return LLMError("The AI service returned an auth error (HTTP 401). Please try again.")
     if "status" in msg or "http" in msg:
-        return LLMError(f"The AI service returned an error. Please try again.")
+        return LLMError("The AI service returned an error. Please try again.")
     logger.exception("Unexpected LLM error: %s", e)
     return LLMError("Unexpected error from AI provider. Please try again.")
 
