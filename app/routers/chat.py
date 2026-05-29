@@ -1,7 +1,7 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 logger = logging.getLogger(__name__)
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -123,6 +123,7 @@ async def send_message(
 
 @router.post("/stream")
 async def send_message_stream(
+    request: Request,
     payload: ChatRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -196,6 +197,24 @@ async def send_message_stream(
         full_reply = []
         try:
             async for delta in stream_reply(payload.model, history):
+                if await request.is_disconnected():
+                    partial = "".join(full_reply)
+                    logger.info(
+                        "Stream cancelled by client | conv_id=%s model=%s partial_chars=%d",
+                        conversation_id, model_name, len(partial),
+                    )
+                    if partial:
+                        async with AsyncSessionLocal() as session:
+                            session.add(Message(
+                                conversation_id=conversation_id, role="user", content=user_message
+                            ))
+                            session.add(Message(
+                                conversation_id=conversation_id, role="assistant",
+                                content=partial, model=model_name,
+                            ))
+                            await session.commit()
+                            logger.info("Stream partial reply saved | conv_id=%s chars=%d", conversation_id, len(partial))
+                    return
                 full_reply.append(delta)
                 yield sse({"type": "chunk", "delta": delta})
         except LLMTimeoutError as e:
