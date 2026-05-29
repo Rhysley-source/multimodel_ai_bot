@@ -58,8 +58,10 @@ def resolve_model(short_name: str | None) -> tuple[str, str, str]:
     """Return (short_name, provider, full_model_id)."""
     name = short_name or DEFAULT_MODEL
     if name not in MODEL_REGISTRY:
+        logger.warning("Model resolve failed | requested=%s available=%s", name, list(MODEL_REGISTRY))
         raise LLMError(f"Unknown model '{name}'. Available: {', '.join(MODEL_REGISTRY)}")
     provider, full_id = MODEL_REGISTRY[name]
+    logger.debug("Model resolved | short=%s provider=%s model_id=%s", name, provider, full_id)
     return name, provider, full_id
 
 
@@ -67,14 +69,17 @@ def _build_llm(provider: str, model_id: str):
     """Return a cached LangChain chat model — creates once, reuses across requests."""
     cache_key = f"{provider}:{model_id}"
     if cache_key in _llm_cache:
+        logger.debug("LLM client cache hit | %s", cache_key)
         return _llm_cache[cache_key]
 
+    logger.info("LLM client init | provider=%s model_id=%s", provider, model_id)
     from langchain_openai import ChatOpenAI
 
     llm = None
 
     if provider == "openai":
         if not settings.OPENAI_API_KEY:
+            logger.error("LLM client init failed | provider=openai reason=OPENAI_API_KEY not set")
             raise LLMError("OPENAI_API_KEY is not set in .env.")
         llm = ChatOpenAI(
             model=model_id,
@@ -86,6 +91,7 @@ def _build_llm(provider: str, model_id: str):
 
     elif provider == "grok":
         if not settings.GROK_API_KEY:
+            logger.error("LLM client init failed | provider=grok reason=GROK_API_KEY not set")
             raise LLMError("GROK_API_KEY is not set in .env.")
         llm = ChatOpenAI(
             model=model_id,
@@ -98,6 +104,7 @@ def _build_llm(provider: str, model_id: str):
 
     elif provider == "deepseek":
         if not settings.DEEPSEEK_API_KEY:
+            logger.error("LLM client init failed | provider=deepseek reason=DEEPSEEK_API_KEY not set")
             raise LLMError("DEEPSEEK_API_KEY is not set in .env.")
         llm = ChatOpenAI(
             model=model_id,
@@ -111,6 +118,7 @@ def _build_llm(provider: str, model_id: str):
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         if not settings.ANTHROPIC_API_KEY:
+            logger.error("LLM client init failed | provider=anthropic reason=ANTHROPIC_API_KEY not set")
             raise LLMError("ANTHROPIC_API_KEY is not set in .env.")
         llm = ChatAnthropic(
             model=model_id,
@@ -120,9 +128,11 @@ def _build_llm(provider: str, model_id: str):
         )
 
     else:
+        logger.error("LLM client init failed | provider=%s reason=unsupported", provider)
         raise LLMError(f"Unsupported provider: {provider}")
 
     _llm_cache[cache_key] = llm
+    logger.info("LLM client ready | provider=%s model_id=%s", provider, model_id)
     return llm
 
 
@@ -134,6 +144,7 @@ def _build_messages(history: list[dict]) -> list:
             msgs.append(HumanMessage(content=m["content"]))
         else:
             msgs.append(AIMessage(content=m["content"]))
+    logger.debug("Messages built | total=%d (1 system + %d history)", len(msgs), len(history))
     return msgs
 
 
@@ -167,16 +178,24 @@ async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[s
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history)
 
-    logger.info("LLM request | model=%s provider=%s messages=%d", name, provider, len(messages))
+    logger.info("LLM request | model=%s provider=%s model_id=%s messages=%d",
+                name, provider, model_id, len(messages))
     try:
+        import time
+        t0 = time.monotonic()
         response = await llm.ainvoke(messages)
+        elapsed = time.monotonic() - t0
         reply = response.content
     except LLMError:
         raise
     except Exception as e:
+        logger.error("LLM request failed | model=%s provider=%s error=%s", name, provider, e)
         raise _wrap_error(e) from e
 
-    logger.info("LLM response | model=%s chars=%d", name, len(reply))
+    logger.info(
+        "LLM response OK | model=%s provider=%s model_id=%s chars=%d elapsed=%.2fs",
+        name, provider, model_id, len(reply), elapsed,
+    )
     return reply, name
 
 
@@ -189,12 +208,26 @@ async def stream_reply(short_name: str | None, history: list[dict]) -> AsyncGene
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history)
 
-    logger.info("LLM stream | model=%s provider=%s messages=%d", name, provider, len(messages))
+    logger.info("LLM stream start | model=%s provider=%s model_id=%s messages=%d",
+                name, provider, model_id, len(messages))
     try:
+        import time
+        t0 = time.monotonic()
+        chunk_count = 0
+        total_chars = 0
         async for chunk in llm.astream(messages):
             if chunk.content:
+                chunk_count += 1
+                total_chars += len(chunk.content)
                 yield chunk.content
     except LLMError:
         raise
     except Exception as e:
+        logger.error("LLM stream failed | model=%s provider=%s error=%s", name, provider, e)
         raise _wrap_error(e) from e
+
+    elapsed = time.monotonic() - t0
+    logger.info(
+        "LLM stream OK | model=%s provider=%s model_id=%s chunks=%d chars=%d elapsed=%.2fs",
+        name, provider, model_id, chunk_count, total_chars, elapsed,
+    )
