@@ -33,6 +33,19 @@ MODEL_REGISTRY = {
     "claude-opus":      ("anthropic", "claude-opus-4-7"),
 }
 
+# Identity prefix injected into the system prompt so each model knows who it is.
+# DeepSeek models especially tend to claim they are Claude without this.
+MODEL_IDENTITY = {
+    "gpt":          "You are GPT-4o, a large language model made by OpenAI.",
+    "gpt-mini":     "You are GPT-4o mini, a large language model made by OpenAI.",
+    "grok":         "You are Grok 3, an AI assistant made by xAI.",
+    "grok-mini":    "You are Grok 3 mini, an AI assistant made by xAI.",
+    "deepseek":     "You are DeepSeek Chat, an AI assistant made by DeepSeek.",
+    "deepseek-r1":  "You are DeepSeek R1, a reasoning AI assistant made by DeepSeek.",
+    "claude":       "You are Claude Sonnet, an AI assistant made by Anthropic.",
+    "claude-opus":  "You are Claude Opus, an AI assistant made by Anthropic.",
+}
+
 DEFAULT_MODEL = settings.DEFAULT_MODEL
 LLM_TIMEOUT   = 30.0
 
@@ -136,15 +149,17 @@ def _build_llm(provider: str, model_id: str):
     return llm
 
 
-def _build_messages(history: list[dict]) -> list:
+def _build_messages(history: list[dict], model_name: str) -> list:
     """Convert history dicts to LangChain message objects with system prompt."""
-    msgs = [SystemMessage(content=settings.SYSTEM_PROMPT)]
+    identity = MODEL_IDENTITY.get(model_name, "")
+    system_content = f"{identity}\n\n{settings.SYSTEM_PROMPT}" if identity else settings.SYSTEM_PROMPT
+    msgs = [SystemMessage(content=system_content)]
     for m in history:
         if m["role"] == "user":
             msgs.append(HumanMessage(content=m["content"]))
         else:
             msgs.append(AIMessage(content=m["content"]))
-    logger.debug("Messages built | total=%d (1 system + %d history)", len(msgs), len(history))
+    logger.debug("Messages built | model=%s total=%d (1 system + %d history)", model_name, len(msgs), len(history))
     return msgs
 
 
@@ -176,7 +191,7 @@ async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[s
     """
     name, provider, model_id = resolve_model(short_name)
     llm = _build_llm(provider, model_id)
-    messages = _build_messages(history)
+    messages = _build_messages(history, name)
 
     logger.info("LLM request | model=%s provider=%s model_id=%s messages=%d",
                 name, provider, model_id, len(messages))
@@ -206,7 +221,7 @@ async def stream_reply(short_name: str | None, history: list[dict]) -> AsyncGene
     """
     name, provider, model_id = resolve_model(short_name)
     llm = _build_llm(provider, model_id)
-    messages = _build_messages(history)
+    messages = _build_messages(history, name)
 
     logger.info("LLM stream start | model=%s provider=%s model_id=%s messages=%d",
                 name, provider, model_id, len(messages))
