@@ -200,9 +200,13 @@ def _wrap_error(e: Exception) -> LLMError:
     return LLMError("Unexpected error from AI provider. Please try again.")
 
 
-async def _call_llm(name: str, provider: str, model_id: str, history: list[dict]) -> tuple[str, str]:
-    """Core LLM call — returns (reply_text, model_name). Raises LLMError on failure."""
+async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[str, str]:
+    """
+    Send history to the chosen model and return (reply_text, model_name).
+    Raises LLMError directly if the model fails — no fallback.
+    """
     import time
+    name, provider, model_id = resolve_model(short_name)
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history, name)
 
@@ -224,35 +228,15 @@ async def _call_llm(name: str, provider: str, model_id: str, history: list[dict]
     return reply, name
 
 
-async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[str, str]:
-    """
-    Send history to the chosen model and return (reply_text, model_name).
-    Falls back to DEFAULT_MODEL if the requested model fails.
-    """
-    name, provider, model_id = resolve_model(short_name)
-    try:
-        return await _call_llm(name, provider, model_id, history)
-    except LLMError as primary_err:
-        fallback = DEFAULT_MODEL
-        if name == fallback:
-            raise
-        logger.warning(
-            "Model failed, switching to fallback | primary=%s fallback=%s reason=%s",
-            name, fallback, primary_err,
-        )
-        fb_name, fb_provider, fb_model_id = resolve_model(fallback)
-        try:
-            return await _call_llm(fb_name, fb_provider, fb_model_id, history)
-        except LLMError:
-            logger.error("Fallback model also failed | fallback=%s", fallback)
-            raise primary_err
-
-
-async def _stream_llm(
-    name: str, provider: str, model_id: str, history: list[dict]
+async def stream_reply(
+    short_name: str | None, history: list[dict]
 ) -> AsyncGenerator[str, None]:
-    """Core stream generator for a single model."""
+    """
+    Async generator yielding text chunks from the chosen model.
+    Raises LLMError directly if the model fails — no fallback.
+    """
     import time
+    name, provider, model_id = resolve_model(short_name)
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history, name)
 
@@ -276,37 +260,3 @@ async def _stream_llm(
     elapsed = time.monotonic() - t0
     logger.info("LLM stream OK | model=%s provider=%s model_id=%s chunks=%d chars=%d elapsed=%.2fs",
                 name, provider, model_id, chunk_count, total_chars, elapsed)
-
-
-async def stream_reply(
-    short_name: str | None, history: list[dict]
-) -> AsyncGenerator[str, None]:
-    """
-    Async generator yielding text chunks from the chosen model.
-    Falls back to DEFAULT_MODEL if the requested model fails before streaming starts.
-    """
-    name, provider, model_id = resolve_model(short_name)
-    primary_err = None
-
-    try:
-        async for chunk in _stream_llm(name, provider, model_id, history):
-            yield chunk
-        return
-    except LLMError as e:
-        primary_err = e
-
-    fallback = DEFAULT_MODEL
-    if name == fallback:
-        raise primary_err
-
-    logger.warning(
-        "Stream model failed, switching to fallback | primary=%s fallback=%s reason=%s",
-        name, fallback, primary_err,
-    )
-    fb_name, fb_provider, fb_model_id = resolve_model(fallback)
-    try:
-        async for chunk in _stream_llm(fb_name, fb_provider, fb_model_id, history):
-            yield chunk
-    except LLMError:
-        logger.error("Fallback stream also failed | fallback=%s", fallback)
-        raise primary_err
