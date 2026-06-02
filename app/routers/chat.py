@@ -21,6 +21,7 @@ from app.llm import (
     resolve_model,
     stream_reply,
 )
+from app.guardrails import chat_rate_limiter, check_input, check_output
 from app.models import Conversation, Message, User
 from app.schemas import (
     ChatRequest,
@@ -68,7 +69,17 @@ async def send_message(
     current_user: User = Depends(get_current_user),
 ):
     """Send a user query, get an LLM reply. Persists both messages."""
-    # 1. Get or create the conversation (and verify ownership).
+    # 1. Guardrails — rate limit + input safety
+    if not chat_rate_limiter.is_allowed(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many messages. Please slow down and try again in a minute.",
+        )
+    is_safe, reason = check_input(payload.message, current_user.id)
+    if not is_safe:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+
+    # 2. Get or create the conversation (and verify ownership).
     existing_messages = []
     if payload.conversation_id is not None:
         result = await db.execute(
@@ -104,7 +115,12 @@ async def send_message(
     except LLMError as e:
         return _llm_error_response(e, payload.message)
 
-    # 4. Persist both the user message and the assistant reply.
+    # 4. Output guardrail — check reply before returning.
+    out_safe, out_reason = check_output(reply_text, model_name, current_user.id)
+    if not out_safe:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=out_reason)
+
+    # 5. Persist both the user message and the assistant reply.
     db.add(Message(
         conversation_id=conversation.id, role="user", content=payload.message
     ))
@@ -138,6 +154,16 @@ async def send_message_stream(
       {"type": "done",  "conversation_id": 12}
       {"type": "error", "detail": "..."}   (on failure)
     """
+    # Guardrails — rate limit + input safety (before stream starts)
+    if not chat_rate_limiter.is_allowed(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many messages. Please slow down and try again in a minute.",
+        )
+    is_safe, reason = check_input(payload.message, current_user.id)
+    if not is_safe:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+
     # Validate the model up front so a bad model is a clean HTTP 400, not mid-stream.
     try:
         model_name, _provider, _model_id = resolve_model(payload.model)
@@ -245,6 +271,12 @@ async def send_message_stream(
             "Stream done | conv_id=%s model=%s chunks=%d chars=%d",
             conversation_id, model_name, len(full_reply), len(reply_text),
         )
+
+        # Output guardrail — check full reply before saving or signalling done
+        out_safe, out_reason = check_output(reply_text, model_name, current_user.id)
+        if not out_safe:
+            yield sse({"type": "error", "code": 502, "detail": out_reason, "user_message": user_message})
+            return
 
         async with AsyncSessionLocal() as session:
             session.add(Message(
