@@ -192,9 +192,11 @@ async def send_message_stream(
         def sse(obj: dict) -> str:
             return f"data: {json.dumps(obj)}\n\n"
 
-        yield sse({"type": "meta", "conversation_id": conversation_id, "model": model_name})
+        yield sse({"type": "meta", "conversation_id": conversation_id, "model": model_name,
+                   "requested_model": payload.model or model_name})
 
         full_reply = []
+        actual_model = model_name
         try:
             async for delta in stream_reply(payload.model, history):
                 if await request.is_disconnected():

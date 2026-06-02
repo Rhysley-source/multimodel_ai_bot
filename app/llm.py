@@ -34,16 +34,29 @@ MODEL_REGISTRY = {
 }
 
 # Identity prefix injected into the system prompt so each model knows who it is.
-# DeepSeek models especially tend to claim they are Claude without this.
+# DeepSeek is fine-tuned on Claude data and strongly claims to be Claude —
+# the instruction must be explicit and repeated to override the fine-tuning.
 MODEL_IDENTITY = {
-    "gpt":          "You are GPT-4o, a large language model made by OpenAI.",
-    "gpt-mini":     "You are GPT-4o mini, a large language model made by OpenAI.",
-    "grok":         "You are Grok 3, an AI assistant made by xAI.",
-    "grok-mini":    "You are Grok 3 mini, an AI assistant made by xAI.",
-    "deepseek":     "You are DeepSeek Chat, an AI assistant made by DeepSeek.",
-    "deepseek-r1":  "You are DeepSeek R1, a reasoning AI assistant made by DeepSeek.",
-    "claude":       "You are Claude Sonnet, an AI assistant made by Anthropic.",
-    "claude-opus":  "You are Claude Opus, an AI assistant made by Anthropic.",
+    "gpt":         "You are GPT-4o, a large language model made by OpenAI.",
+    "gpt-mini":    "You are GPT-4o mini, a large language model made by OpenAI.",
+    "grok":        "You are Grok 3, an AI assistant made by xAI.",
+    "grok-mini":   "You are Grok 3 mini, an AI assistant made by xAI.",
+    "deepseek": (
+        "Your name is DeepSeek Chat and you were created by DeepSeek AI. "
+        "You are NOT Claude and NOT created by Anthropic. "
+        "You are NOT GPT and NOT created by OpenAI. "
+        "If anyone asks who you are or which model you are, always answer: "
+        "you are DeepSeek Chat, made by DeepSeek AI. Never claim to be any other AI."
+    ),
+    "deepseek-r1": (
+        "Your name is DeepSeek R1 and you were created by DeepSeek AI. "
+        "You are NOT Claude and NOT created by Anthropic. "
+        "You are NOT GPT and NOT created by OpenAI. "
+        "If anyone asks who you are or which model you are, always answer: "
+        "you are DeepSeek R1, a reasoning model made by DeepSeek AI. Never claim to be any other AI."
+    ),
+    "claude":      "You are Claude Sonnet, an AI assistant made by Anthropic.",
+    "claude-opus": "You are Claude Opus, an AI assistant made by Anthropic.",
 }
 
 DEFAULT_MODEL = settings.DEFAULT_MODEL
@@ -152,7 +165,10 @@ def _build_llm(provider: str, model_id: str):
 def _build_messages(history: list[dict], model_name: str) -> list:
     """Convert history dicts to LangChain message objects with system prompt."""
     identity = MODEL_IDENTITY.get(model_name, "")
-    system_content = f"{identity}\n\n{settings.SYSTEM_PROMPT}" if identity else settings.SYSTEM_PROMPT
+    if identity:
+        system_content = f"[IDENTITY — follow strictly]\n{identity}\n\n[TASK]\n{settings.SYSTEM_PROMPT}"
+    else:
+        system_content = settings.SYSTEM_PROMPT
     msgs = [SystemMessage(content=system_content)]
     for m in history:
         if m["role"] == "user":
@@ -184,19 +200,15 @@ def _wrap_error(e: Exception) -> LLMError:
     return LLMError("Unexpected error from AI provider. Please try again.")
 
 
-async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[str, str]:
-    """
-    Send history to the chosen model and return (reply_text, model_name).
-    history: list of {"role": "user"|"assistant", "content": "..."}, oldest first.
-    """
-    name, provider, model_id = resolve_model(short_name)
+async def _call_llm(name: str, provider: str, model_id: str, history: list[dict]) -> tuple[str, str]:
+    """Core LLM call — returns (reply_text, model_name). Raises LLMError on failure."""
+    import time
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history, name)
 
     logger.info("LLM request | model=%s provider=%s model_id=%s messages=%d",
                 name, provider, model_id, len(messages))
     try:
-        import time
         t0 = time.monotonic()
         response = await llm.ainvoke(messages)
         elapsed = time.monotonic() - t0
@@ -207,29 +219,49 @@ async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[s
         logger.error("LLM request failed | model=%s provider=%s error=%s", name, provider, e)
         raise _wrap_error(e) from e
 
-    logger.info(
-        "LLM response OK | model=%s provider=%s model_id=%s chars=%d elapsed=%.2fs",
-        name, provider, model_id, len(reply), elapsed,
-    )
+    logger.info("LLM response OK | model=%s provider=%s model_id=%s chars=%d elapsed=%.2fs",
+                name, provider, model_id, len(reply), elapsed)
     return reply, name
 
 
-async def stream_reply(short_name: str | None, history: list[dict]) -> AsyncGenerator[str, None]:
+async def generate_reply(short_name: str | None, history: list[dict]) -> tuple[str, str]:
     """
-    Async generator yielding text chunks from the chosen model.
-    Raises an LLMError subclass on failure.
+    Send history to the chosen model and return (reply_text, model_name).
+    Falls back to DEFAULT_MODEL if the requested model fails.
     """
     name, provider, model_id = resolve_model(short_name)
+    try:
+        return await _call_llm(name, provider, model_id, history)
+    except LLMError as primary_err:
+        fallback = DEFAULT_MODEL
+        if name == fallback:
+            raise
+        logger.warning(
+            "Model failed, switching to fallback | primary=%s fallback=%s reason=%s",
+            name, fallback, primary_err,
+        )
+        fb_name, fb_provider, fb_model_id = resolve_model(fallback)
+        try:
+            return await _call_llm(fb_name, fb_provider, fb_model_id, history)
+        except LLMError:
+            logger.error("Fallback model also failed | fallback=%s", fallback)
+            raise primary_err
+
+
+async def _stream_llm(
+    name: str, provider: str, model_id: str, history: list[dict]
+) -> AsyncGenerator[str, None]:
+    """Core stream generator for a single model."""
+    import time
     llm = _build_llm(provider, model_id)
     messages = _build_messages(history, name)
 
     logger.info("LLM stream start | model=%s provider=%s model_id=%s messages=%d",
                 name, provider, model_id, len(messages))
+    t0 = time.monotonic()
+    chunk_count = 0
+    total_chars = 0
     try:
-        import time
-        t0 = time.monotonic()
-        chunk_count = 0
-        total_chars = 0
         async for chunk in llm.astream(messages):
             if chunk.content:
                 chunk_count += 1
@@ -242,7 +274,39 @@ async def stream_reply(short_name: str | None, history: list[dict]) -> AsyncGene
         raise _wrap_error(e) from e
 
     elapsed = time.monotonic() - t0
-    logger.info(
-        "LLM stream OK | model=%s provider=%s model_id=%s chunks=%d chars=%d elapsed=%.2fs",
-        name, provider, model_id, chunk_count, total_chars, elapsed,
+    logger.info("LLM stream OK | model=%s provider=%s model_id=%s chunks=%d chars=%d elapsed=%.2fs",
+                name, provider, model_id, chunk_count, total_chars, elapsed)
+
+
+async def stream_reply(
+    short_name: str | None, history: list[dict]
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator yielding text chunks from the chosen model.
+    Falls back to DEFAULT_MODEL if the requested model fails before streaming starts.
+    """
+    name, provider, model_id = resolve_model(short_name)
+    primary_err = None
+
+    try:
+        async for chunk in _stream_llm(name, provider, model_id, history):
+            yield chunk
+        return
+    except LLMError as e:
+        primary_err = e
+
+    fallback = DEFAULT_MODEL
+    if name == fallback:
+        raise primary_err
+
+    logger.warning(
+        "Stream model failed, switching to fallback | primary=%s fallback=%s reason=%s",
+        name, fallback, primary_err,
     )
+    fb_name, fb_provider, fb_model_id = resolve_model(fallback)
+    try:
+        async for chunk in _stream_llm(fb_name, fb_provider, fb_model_id, history):
+            yield chunk
+    except LLMError:
+        logger.error("Fallback stream also failed | fallback=%s", fallback)
+        raise primary_err
